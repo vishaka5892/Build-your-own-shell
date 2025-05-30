@@ -91,6 +91,7 @@ int main() {
         }
 
         if (fgets(input, sizeof(input), stdin) == NULL) break;
+        input[strcspn(input, "\n")] = '\0';  // Remove trailing newline
 
         char *args[MAX_ARGS];
         int arg_count = parse_input(input, args, MAX_ARGS);
@@ -123,6 +124,7 @@ int main() {
 
         switch (cmd_type) {
             case 0: // echo
+            int saved_stdout = -1;
                 if (is_redirect) {
                     outfd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
                     if (outfd < 0) {
@@ -138,6 +140,11 @@ int main() {
                     if (i < arg_count - 1) printf(" ");
                 }
                 printf("\n");
+
+                if(is_redirect && saved_stdout != -1) {
+                  dup2(saved_stdout, STDOUT_FILENO);
+                  close(saved_stdout);
+                }
                 break;
 
             case 1: // exit
