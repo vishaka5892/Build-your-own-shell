@@ -26,50 +26,64 @@ int is_cmd(char *cmd) {
 
 // Parse input line into arguments, handling quotes and escape characters
 int parse_input(char *input, char *args[], int max_args) {
-    int argc = 0;
-    char *p = input;
+  int argc = 0;
+  char *p = input;
 
-    while (*p && argc < max_args - 1) {
-        while (isspace((unsigned char)*p)) p++;
-        if (*p == '\0') break;
+  while (*p && argc < max_args - 1) {
+      while (isspace((unsigned char)*p)) p++;  // Skip leading whitespace
+      if (*p == '\0') break;  // End of input
 
-        char buffer[1024] = {0};
-        int buf_idx = 0;
+      char buffer[1024] = {0};
+      int buf_idx = 0;
+      bool in_single_quote = false;
+      bool in_double_quote = false;
 
-        while (*p && !isspace((unsigned char)*p)) {
-            if (*p == '\'') {
-                p++;
-                while (*p && *p != '\'') buffer[buf_idx++] = *p++;
-                if (*p == '\'') p++;
-                else {
-                    fprintf(stderr, "parse_input: missing closing single quote\n");
-                    return -1;
-                }
-            } else if (*p == '"') {
-                p++;
-                while (*p && *p != '"') buffer[buf_idx++] = *p++;
-                if (*p == '"') p++;
-                else {
-                    fprintf(stderr, "parse_input: missing closing double quote\n");
-                    return -1;
-                }
-            } else {
-                buffer[buf_idx++] = *p++;
-            }
-        }
+      while (*p) {
+          if (!in_single_quote && !in_double_quote && isspace((unsigned char)*p)) {
+              break;  // End of argument
+          }
 
-        args[argc] = malloc(buf_idx + 1);
-        if (!args[argc]) {
-            fprintf(stderr, "parse_input: memory allocation failed\n");
-            return -1;
-        }
-        memcpy(args[argc], buffer, buf_idx);
-        args[argc][buf_idx] = '\0';
-        argc++;
-    }
+          if (*p == '\\') {  // Handle escape sequences
+              p++;
+              if (*p) buffer[buf_idx++] = *p++;  // Preserve escaped characters
+          } else if (*p == '\'') {  // Handle single quotes correctly
+              in_single_quote = !in_single_quote;
+              p++; // Skip the quote itself
+          } else if (*p == '"') {  // Handle double quotes correctly
+              in_double_quote = !in_double_quote;
+              p++; // Skip the quote itself
+          } else {
+              buffer[buf_idx++] = *p++;
+          }
+      }
 
-    args[argc] = NULL;
-    return argc;
+      if (in_single_quote || in_double_quote) {
+          fprintf(stderr, "parse_input: unmatched quote detected\n");
+          return -1;
+      }
+
+      args[argc] = malloc(buf_idx + 1);
+      if (!args[argc]) {
+          fprintf(stderr, "parse_input: memory allocation failed\n");
+          return -1;
+      }
+      memcpy(args[argc], buffer, buf_idx);
+      args[argc][buf_idx] = '\0';
+
+      // Ensure the first argument (command name) has no surrounding quotes
+      if (argc == 0) {
+          size_t len = strlen(args[argc]);
+          if ((args[argc][0] == '\'' || args[argc][0] == '"') && len > 1) {
+              memmove(args[argc], args[argc] + 1, len - 1); // Remove first quote
+              args[argc][len - 1] = '\0'; // Remove last quote
+          }
+      }
+
+      argc++;
+  }
+
+  args[argc] = NULL;  // Null-terminate argument list
+  return argc;
 }
 
 // Free dynamically allocated arguments
@@ -104,6 +118,7 @@ int main() {
         char *outfile = NULL;
         int outfd = -1;
         bool is_redirect = false;
+        int saved_stdout = -1;
 
         // Detect output redirection
         for (int i = 0; i < arg_count - 1; i++) {
@@ -119,32 +134,34 @@ int main() {
                 break;
             }
         }
+         
+        if (is_redirect) {
+          saved_stdout = dup(STDOUT_FILENO);
+          outfd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+          if (outfd < 0) {
+              fprintf(stderr, "Error opening file %s: %s\n", outfile, strerror(errno));
+              free_args(args, arg_count);
+              continue;
+          }
+          dup2(outfd, STDOUT_FILENO);
+          close(outfd);
+      }
 
         int cmd_type = is_cmd(args[0]);
 
         switch (cmd_type) {
             case 0: // echo
-            int saved_stdout = -1;
-                if (is_redirect) {
-                    outfd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-                    if (outfd < 0) {
-                        fprintf(stderr, "Error opening file %s: %s\n", outfile, strerror(errno));
-                        free_args(args, arg_count);
-                        continue;
-                    }
-                    dup2(outfd, STDOUT_FILENO);
-                    close(outfd);
-                }
+           
                 for (int i = 1; i < arg_count; i++) {
                     printf("%s", args[i]);
                     if (i < arg_count - 1) printf(" ");
                 }
                 printf("\n");
 
-                if(is_redirect && saved_stdout != -1) {
-                  dup2(saved_stdout, STDOUT_FILENO);
-                  close(saved_stdout);
-                }
+              //  if(is_redirect && saved_stdout != -1) {
+               //   dup2(saved_stdout, STDOUT_FILENO);
+                //  close(saved_stdout);
+               // }
                 break;
 
             case 1: // exit
@@ -219,30 +236,39 @@ int main() {
             {
                 pid_t pid = fork();
                 if (pid == 0) {
-                    if (is_redirect) {
-                        outfd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-                        if (outfd < 0) {
-                            fprintf(stderr, "Error opening file %s: %s\n", outfile, strerror(errno));
-                            exit(1);
-                        }
-                        dup2(outfd, STDOUT_FILENO);
-                        close(outfd);
-                    }
-                    execvp(args[0], args);
-                    fprintf(stderr, "%s: command not found\n", args[0]);
-                    exit(127);
+                  //  if (is_redirect) {
+                   //     outfd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                    //    if (outfd < 0) {
+                     //       fprintf(stderr, "Error opening file %s: %s\n", outfile, strerror(errno));
+                      //      exit(1);
+                       // }
+                        //dup2(outfd, STDOUT_FILENO);
+                       // close(outfd);
+                   // }
+                   execvp(args[0], args);
+                   if (errno == ENOENT && args[0][0] != '/' && strchr(args[0], ' ')) {
+                       char path[1024];
+                       snprintf(path, sizeof(path), "./%s", args[0]);
+                       execv(path, args);
+                   }
+                   fprintf(stderr, "%s: command not found\n", args[0]);
+                   exit(127);
+                   
                 } else if (pid > 0) {
                     int status;
                     waitpid(pid, &status, 0);
                 } else {
                     perror("fork failed");
                 }
+              }
                 break;
             }
+            if(is_redirect) {
+                dup2(saved_stdout, STDOUT_FILENO);
+                close(saved_stdout);
+            
         }
-
         free_args(args, arg_count);
-    }
-
+      }
     return 0;
 }
