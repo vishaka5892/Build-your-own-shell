@@ -8,11 +8,42 @@
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #define CMD_LST_SIZE 5
 #define MAX_ARGS 50
 
 char *cmd_lst[] = {"echo", "exit", "type", "pwd", "cd"};
+char *builtin_cmds[] = {"echo", "exit", NULL};
+
+// Autocomplete for built-in commands
+char *builtin_completion(const char *text, int state) {
+    static int list_index, len;
+    const char *name;
+
+    if (state == 0) {
+        list_index = 0;
+        len = strlen(text);
+    }
+
+    while ((name = builtin_cmds[list_index++])) {
+        if (strncmp(name, text, len) == 0) {
+            char *match = malloc(strlen(name) + 2); // include space
+            if (!match) return NULL;
+            sprintf(match, "%s", name);
+            return match;
+        }
+    }
+
+    return NULL;
+}
+
+char **my_completion(const char *text, int start, int end) {
+    rl_attempted_completion_function = NULL;
+    rl_attempted_completion_over = 1;
+    return rl_completion_matches(text, builtin_completion);
+}
 
 // Check if input command matches a known command
 int is_cmd(char *cmd) {
@@ -88,22 +119,24 @@ void free_args(char *args[], int argc) {
 
 int main() {
     char input[1024];
+    rl_attempted_completion_function = my_completion;
     setbuf(stdout, NULL);
 
     while (1) {
-        if (isatty(STDOUT_FILENO)) {
-            fputs("$ ", stdout);
-            fflush(stdout);
-        }
+        char *line = readline("$ ");
+        if (!line) break;
 
-        if (fgets(input, sizeof(input), stdin) == NULL) break;
-        input[strcspn(input, "\n")] = '\0';
+        if (*line) add_history(line);
+
+        strncpy(input, line, sizeof(input) - 1);
+        input[sizeof(input) - 1] = '\0';
+        free(line);
 
         char *args[MAX_ARGS];
         int arg_count = parse_input(input, args, MAX_ARGS);
 
         if (arg_count <= 0) {
-            free_args(args, arg_count);
+            if (arg_count > 0) free_args(args, arg_count);
             continue;
         }
 
@@ -112,51 +145,67 @@ int main() {
         bool append_out = false, append_err = false;
         int saved_stdout = -1, saved_stderr = -1;
 
-        // Detect output and error redirection
-        for (int i = 0; i < arg_count - 1; i++) {
-            if (strcmp(args[i], ">") == 0 || strcmp(args[i], "1>") == 0) {
-                outfile = args[i + 1];
-                redirect_out = true;
-                append_out = false;
-            } else if (strcmp(args[i], ">>") == 0 || strcmp(args[i], "1>>") == 0) {
-                outfile = args[i + 1];
-                redirect_out = true;
-                append_out = true;
-            } else if (strcmp(args[i], "2>") == 0) {
-                errfile = args[i + 1];
-                redirect_err = true;
-                append_err = false;
-            } else if (strcmp(args[i], "2>>") == 0) {
-                errfile = args[i + 1];
-                redirect_err = true;
-                append_err = true;
-            } else {
-                continue;
-            }
+        // Updated redirection parsing
+        for (int i = 0; i < arg_count; i++) {
+            if ((strcmp(args[i], ">") == 0 || strcmp(args[i], "1>") == 0 ||
+                 strcmp(args[i], ">>") == 0 || strcmp(args[i], "1>>") == 0 ||
+                 strcmp(args[i], "2>") == 0 || strcmp(args[i], "2>>") == 0)) {
 
-            // Remove redirection operator and target
-            for (int j = i; j + 2 <= arg_count; j++) {
-                args[j] = args[j + 2];
+                if (i + 1 >= arg_count) {
+                    fprintf(stderr, "Redirection operator '%s' missing file operand\n", args[i]);
+                    free_args(args, arg_count);
+                    return -1;
+                }
+
+                char *op = args[i];
+                char *filename = args[i + 1];
+
+                if (strcmp(op, ">") == 0 || strcmp(op, "1>") == 0) {
+                    outfile = strdup(filename);
+                    redirect_out = true;
+                    append_out = false;
+                } else if (strcmp(op, ">>") == 0 || strcmp(op, "1>>") == 0) {
+                    outfile = strdup(filename);
+                    redirect_out = true;
+                    append_out = true;
+                } else if (strcmp(op, "2>") == 0) {
+                    errfile = strdup(filename);
+                    redirect_err = true;
+                    append_err = false;
+                } else if (strcmp(op, "2>>") == 0) {
+                    errfile = strdup(filename);
+                    redirect_err = true;
+                    append_err = true;
+                }
+
+                free(args[i]);
+                free(args[i + 1]);
+                for (int j = i; j + 2 < arg_count; j++) {
+                    args[j] = args[j + 2];
+                }
+                arg_count -= 2;
+                i--;
             }
-            arg_count -= 2;
-            i--;
         }
+        args[arg_count] = NULL;
 
         // Set up redirection
-        if (redirect_out) {
+        if (redirect_out && outfile) {
             saved_stdout = dup(STDOUT_FILENO);
             int flags = O_CREAT | O_WRONLY | (append_out ? O_APPEND : O_TRUNC);
             int outfd = open(outfile, flags, 0644);
             if (outfd < 0) {
                 fprintf(stderr, "Error opening file %s: %s\n", outfile, strerror(errno));
                 free_args(args, arg_count);
-                goto loop_continue;
+                free(outfile);
+                free(errfile);
+                continue;
             }
             dup2(outfd, STDOUT_FILENO);
             close(outfd);
         }
 
-        if (redirect_err) {
+        if (redirect_err && errfile) {
             saved_stderr = dup(STDERR_FILENO);
             int flags = O_CREAT | O_WRONLY | (append_err ? O_APPEND : O_TRUNC);
             int errfd = open(errfile, flags, 0644);
@@ -167,7 +216,9 @@ int main() {
                     close(saved_stdout);
                 }
                 free_args(args, arg_count);
-                goto loop_continue;
+                free(outfile);
+                free(errfile);
+                continue;
             }
             dup2(errfd, STDERR_FILENO);
             close(errfd);
@@ -189,6 +240,8 @@ int main() {
                 int status = 0;
                 if (arg_count > 1) status = atoi(args[1]);
                 free_args(args, arg_count);
+                if (outfile) free(outfile);
+                if (errfile) free(errfile);
                 return status;
             }
 
@@ -203,6 +256,10 @@ int main() {
                         char *path = getenv("PATH");
                         if (path) {
                             char *path_dup = strdup(path);
+                            if (!path_dup) {
+                                fprintf(stderr, "type: memory error\n");
+                                break;
+                            }
                             char *dir = strtok(path_dup, ":");
                             bool found = false;
                             while (dir != NULL) {
@@ -282,9 +339,11 @@ int main() {
                 } else {
                     perror("fork failed");
                 }
-            }
         }
 
+        }
+
+        // Restore output and error FDs
         if (redirect_out && saved_stdout != -1) {
             dup2(saved_stdout, STDOUT_FILENO);
             close(saved_stdout);
@@ -295,9 +354,8 @@ int main() {
         }
 
         free_args(args, arg_count);
-
-    loop_continue:
-        continue;
+        if (outfile) free(outfile);
+        if (errfile) free(errfile);
     }
 
     return 0;
